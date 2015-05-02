@@ -1,0 +1,363 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Mar 25 19:30:58 2015
+
+@author: roger_000
+"""
+
+
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+import pprint
+import re
+import codecs
+import json
+from pymongo import MongoClient
+
+#client  = MongoClient('mongodb://localhost:27017')
+#db = client.examples
+way_cnt = 0
+node_cnt = 0
+
+OSMFILE = "austin_texas.osm"
+street_type_re = re.compile(r'\b\S+\.?$', re.IGNORECASE)
+
+#Added Crossing, Highway, Expressway, Way, Pass, Speedway, IH-35, Loop, Circle, Cove
+expected = ["Street", "Avenue", "Boulevard", "Drive", "Court", "Place", "Square", "Lane", "Road", 
+            "Trail", "Parkway", "Commons", "Crossing", "Highway", "Expressway", "Way", "Pass", "Speedway", "IH-35",
+            "Loop", "Circle", "Cove", "620", "IH-35", "183"]
+
+# From inspecting database, found and added most commonly required changes for consistency
+mapping = { "St": "Street",
+            "St.": "Street",
+            "street": "Street",
+            "Ave": "Avenue",
+            "Ave.": "Avenue",
+            "Avene": "Avenue",
+            "Rd.": "Road",
+            "Rd": "Road",
+            "RD": "Road",
+            "Blvd": "Boulevard",
+            "Blvd.": "Boulevard",
+            "Cir": "Circle",
+            "Ct": "Court",
+            "Cv": "Cove",
+            "Dr": "Drive",
+            "Dr.": "Drive",
+            "Expy": "Expressway",
+            "Expwy": "Expressway",
+            "Hwy": "Highway",
+            "I35": "IH-35",
+            "IH35": "IH-35",
+            "Ln": "Lane",
+            "Pkwy": "Parkway",
+            "lane": "Lane"
+            }
+
+# Function to update the street name based on entries in "mapping"
+# Checks "expected" first to see if it is approved name
+def update_name(name, mapping):
+    m = street_type_re.search(name)
+    if m:
+        street_type = m.group()
+        if street_type not in expected:
+            try:
+                new_street_type = mapping[street_type]
+                old_name = name
+                name = name.replace(street_type, new_street_type)
+                #print "Replacement made: ", "street type: ", street_type, "mapping[street_type]", mapping[street_type], "old name: ", old_name, "new name: ", name
+            except:
+                pass
+                #print "No replacement found for ", street_type
+    return name
+
+# Character type analysis
+lower = re.compile(r'^([a-z]|_)*$')
+lower_colon = re.compile(r'^([a-z]|_)*:([a-z]|_)*$')
+problemchars = re.compile(r'[=\+/&<>;\'"\?%#$@\,\. \t\r\n]')
+
+# Function to identify numbers of character types
+def key_type(element, keys):
+    if element.tag == "tag":
+        if re.search(lower, element.attrib['k']):
+            keys['lower'] += 1
+        elif re.search(lower_colon, element.attrib['k']):
+            keys['lower_colon'] += 1
+        elif re.search(problemchars, element.attrib['k']):
+            keys['problemchars'] += 1
+        else:
+            keys['other'] += 1
+        pass
+        
+    return keys
+
+# Initialize character types and call key_type function
+def char_types(filename):
+    keys = {"lower": 0, "lower_colon": 0, "problemchars": 0, "other": 0}
+    for _, element in ET.iterparse(filename):
+        keys = key_type(element, keys)
+
+    return keys
+# End Character type analysis
+
+# Count tags
+def count_tags(filename):
+        tags_dict = {}
+        tree = ET.parse(filename)
+        root = tree.getroot()
+        for child in tree.iter():
+            if child.tag in tags_dict:
+                tags_dict[child.tag] += 1
+            else:
+                tags_dict[child.tag] = 1
+        
+        return tags_dict
+# End count tags
+
+# Audting function used to inspect street types in database
+def audit_street_type(street_types, street_name):
+    m = street_type_re.search(street_name)
+    if m:
+        street_type = m.group()
+        if street_type not in expected:
+            street_types[street_type].add(street_name)
+
+# Checks whether element is of addr:street
+def is_street_name(elem):
+    return (elem.attrib['k'] == "addr:street")
+
+# Function to find tag and call auditing function for street types
+def audit(osmfile):
+    print "start file audit"    
+    osm_file = open(osmfile, "r")
+    print "osm file opened"
+    street_types = defaultdict(set)
+    for event, elem in ET.iterparse(osm_file, events=("start",)):
+        if elem.tag == "node" or elem.tag == "way":
+            for tag in elem.iter("tag"):
+                if is_street_name(tag):
+                    audit_street_type(street_types, tag.attrib['v'])
+    print "end file audit"
+    return street_types
+
+CREATED = [ "version", "changeset", "timestamp", "user", "uid"]
+
+# Function to shape element found into formatted structure (node)
+def shape_element(element):
+    # initialize counters used
+    problem_keys = []
+    global node_cnt
+    global way_cnt
+    #node = {}
+    debug = 0
+    node = dict()
+    node['created'] = {}
+    node['pos'] = [0,0]
+    # Look for just node and way tags and take actions below
+    if element.tag == "node" or element.tag == "way" :
+        # Debug counters to verify count of types
+        if element.tag == "node":
+            node_cnt += 1
+        if element.tag == "way":
+            way_cnt += 1
+        # Get created and location fields and insert into "node"
+        for ekey, evalue in element.attrib.iteritems():
+           if ekey in CREATED:
+                node['created'][ekey] = evalue
+                #print "\ncreated set with value", ekey, evalue
+                #print "\nDebug node: \n", node
+           elif ekey == "lon":
+                node['pos'][1] = float(evalue)
+           elif ekey == 'lat':
+                node['pos'][0] = float(evalue)
+           else:
+                node[ekey] = evalue
+        # look for specific structure problems - problem characters, excess ":"s (3)
+        # Find addr, update name as required, and add address to "node"
+        for tag in element.iter():
+            if tag.tag == 'tag':
+                tkey = tag.attrib['k']
+                tvalue = tag.attrib['v']
+                if problemchars.search(tkey):
+                    problem_keys.append(tkey)
+                elif len(tkey.split(':')) == 3:
+                    problem_keys.append(tkey)
+                elif tkey.split(':')[0] == 'addr':
+                    tvalue = update_name(tvalue, mapping)
+                    if 'address' in node.keys():
+                        node['address'][tkey.split(':')[1]] = tvalue
+                    else:
+                        node['address'] = {tkey.split(':')[1] : tvalue}
+                else:
+                    node[tkey] = tvalue
+                #print "\nNode\n", node
+            # if tag is nd or way (not tag), add these fields as node refs
+            elif tag.tag == 'nd' and element.tag == 'way':
+                if 'node_refs' in node.keys():
+                    node['node_refs'].append(tag.attrib['ref'])
+                else:
+                    node['node_refs'] = [tag.attrib['ref']]
+        node['type'] = element.tag
+
+        return node
+    else:
+        return None
+
+# Top-level routine to process the map file, calls shape_element and writes output
+def process_map(file_in, pretty = False):
+    # You do not need to change this file
+    file_out = "{0}.json".format(file_in)
+    #debug_out = "{0}.jsondebug".format(file_in)
+    data = []
+    elem_count = 0
+    with codecs.open(file_out, "w") as fo:
+        for _, element in ET.iterparse(file_in):
+            elem_count += 1
+            el = shape_element(element)
+            #if (elem_count % 100000) == 0:
+            #    print "elem_count: ", elem_count
+            #    pprint.pprint(el)
+                #print "el: ", el
+            if el:
+                data.append(el)
+                if pretty:
+                    fo.write(json.dumps(el, indent=2)+"\n")
+                else:
+                    fo.write(json.dumps(el) + "\n")
+
+
+    print "\n Total Element Count: ", elem_count
+    return data
+
+# Main routine, run_* added for easier control of what to run in each execution - when True, that section of test is run
+# Probably more elegant way to do this, but this works
+def test():
+    run_street_types = False
+    run_char_types = False
+    run_name_mapping = False
+    run_process_map = True
+    run_tags_summary = False
+    run_names_mapping = False
+    run_create_database = False
+
+    print "start test()"
+
+    if run_process_map:
+        if run_create_database:
+            data = process_map(OSMFILE, True)
+            print "json created"
+        #print "\nnode count = ", node_cnt
+        #print "\nway count = ", way_cnt
+        #print "\n"
+        #pprint.pprint(data[50])
+        #Connect to MongoDB database
+        client  = MongoClient('mongodb://localhost:27017')
+        db = client.newexamples
+        #Insert processed data into database
+        if run_create_database:
+            db.austin.insert(data)
+        #Section to print database stats - node count, way count, etc.
+
+# Works just compute intensive
+        print "DB Stats"
+        print "\nnode count"
+        nd_cnt = db.austin.find({"type":"node"}).count()
+        print "\nNode count ", nd_cnt
+        print "\nway count"
+        wy_cnt = db.austin.find({"type":"way"}).count()
+        print "\nWay count", wy_cnt
+
+
+        print "\nNumber of Unique Users"
+        #num_users = db.austin.distinct('user').length
+        #pprint.pprint(num_users)
+        tusers = [{"$match":{"created.user":{"$exists":1}}}, {"$group":{"_id" : "$created.user","count":{"$sum":1}}}, {"$sort":{"count":-1}}]
+        total_users = db.austin.aggregate(tusers)['result']
+        pprint.pprint(total_users)
+
+
+        print "\n Cuisine types"
+        pipeline = [{"$match":{"cuisine":{"$exists":1}}}, {"$group":{"_id" : "$cuisine","count":{"$sum":1}}}, {"$sort":{"count":-1}}]
+        cuisine = db.austin.aggregate(pipeline)['result']
+        pprint.pprint(cuisine)
+        print "\n Worship Denominations"
+        pipeline = [{"$match":{"denomination":{"$exists":1}}}, {"$group":{"_id" : "$denomination","count":{"$sum":1}}}, {"$sort":{"count":-1}}]
+        denom = db.austin.aggregate(pipeline)['result']
+        pprint.pprint(denom)
+
+ #Sample streets
+        pipeline = [
+            {'$match': {'address.street':{'$exists':1}}},
+            {'$limit' : 5}]
+        examples  = db.austin.aggregate(pipeline)['result']
+        pprint.pprint(examples)
+
+
+        print "\namenities"
+        pipeline = [{"$match":{"amenity":{"$exists":1}}}, {"$group":{"_id" : "$amenity","count":{"$sum":1}}}, {"$sort":{"count":-1}}]
+        amenities = db.austin.aggregate(pipeline)['result']
+        pprint.pprint(amenities)
+        amenities = db.austin.aggregate([{'$match': {'amenity':{'$exists':1}}},
+            {'$limit' : 200}])['result']
+        pprint.pprint(amenities)
+        print "\nsome street addresses"
+        pipeline = [{'$match': {'address.street':{'$exists':1}}},
+            {'$limit' : 5}]
+        result  = db.austin.aggregate(pipeline)['result']
+        pprint.pprint(result)
+        # Find restaurant in database
+        print "\n\n\n\n\nrestaurants"
+        pipeline = [
+            {'$match': {'amenity':'restaurant',
+                        'name':{'$exists':1}}},
+            {'$project':{'_id':'$name',
+                         'cuisine':'$cuisine',
+                         'contact':'$phone'}}]
+#This works just output  intensive!!!
+#        restaurants  = db.austin.aggregate(pipeline)['result']
+#        pprint.pprint(restaurants)
+        #Find all the postcodes used in the database
+        print "\n\n "
+        print "postcode"
+        pipeline = [{"$match":{"address.postcode":{"$exists":1}}}, {"$group":{"_id":"$address.postcode","count":{"$sum":1}}}, {"$sort":{"count":-1}}]
+        postcode = db.austin.aggregate(pipeline)['result']
+        pprint.pprint(postcode)
+        # Find top 10 users
+        print "\n\n\n\nshow top 10 users"
+        pipeline = [
+            {'$match': {'created.user':{'$exists':1}}},
+            {'$group': {'_id':'$created.user',
+                        'count':{'$sum':1}}},
+            {'$sort': {'count':-1}},
+            {'$limit' : 10}]
+        result  = db.austin.aggregate(pipeline)['result']
+        pprint.pprint(result)
+        #streets = db.austin.find({address})
+    print "end test"
+
+# Find the street types
+    if run_street_types:
+        st_types = audit(OSMFILE)
+        #assert len(st_types) == 3
+        #pprint.pprint(dict(st_types))
+
+    if run_names_mapping:
+        for st_type, ways in st_types.iteritems():
+            for name in ways:
+                better_name = update_name(name, mapping)
+                #print name, "=>", better_name
+
+# Look for character types
+    if run_char_types:
+        keys = char_types(OSMFILE)
+        pprint.pprint(keys)
+
+# Get summary of tags used
+    if run_tags_summary:
+        tags = count_tags('austin_texas.osm')
+        pprint.pprint(tags)
+
+    
+
+if __name__ == "__main__":
+  test()
